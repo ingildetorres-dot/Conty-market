@@ -1,0 +1,30 @@
+{
+  "name": "Conty Market POS",
+  "short_name": "Conty Market",
+  "description": "Vende mas, controla todo y haz crecer tu supermercado: ventas, inventario, caja, empleados, balanza y escaner.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F1F6FC",
+  "theme_color": "#0174D1",
+  "lang": "es-CO",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
