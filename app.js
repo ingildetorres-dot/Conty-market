@@ -63,6 +63,7 @@ const A = {
   tab: 'vender',
   carrito: [],
   cliente: null,       // cliente para fiado
+  cuenta: null,        // cuenta abierta (mesa) que se está atendiendo
   descuento: 0,
   turno: null,         // turno de caja abierto
   scan: { buf: '', t: 0, timer: null },
@@ -72,7 +73,7 @@ const A = {
   mem: {}, subs: []
 };
 
-const COLS = ['productos', 'empleados', 'clientes', 'ventas', 'turnos', 'gastos', 'compras', 'ajustes', 'fotos'];
+const COLS = ['productos', 'empleados', 'clientes', 'ventas', 'turnos', 'gastos', 'compras', 'ajustes', 'fotos', 'cuentas', 'mermas', 'movs'];
 COLS.forEach(c => A.mem[c] = {});
 
 const DEF_CFG = {
@@ -94,7 +95,12 @@ const DEF_CFG = {
   btServicio: '0000ffe0-0000-1000-8000-00805f9b34fb',
   btCarac: '0000ffe1-0000-1000-8000-00805f9b34fb',
   imprimir: true,
-  alertaStock: true
+  alertaStock: true,
+  gastosFijosMes: 0,      // arriendo, servicios, nómina — para el punto de equilibrio
+  metaDiaria: 0,          // meta de venta del día
+  impNombre: 'IVA',
+  impPct: 0,              // 0 = sin impuesto discriminado
+  ticketAncho: 32         // columnas de la impresora térmica (32 = 58mm, 48 = 80mm)
 };
 let CFG = { ...DEF_CFG };
 
@@ -164,7 +170,7 @@ async function conectarFirebase() {
 function escucharNube() {
   A.subs.forEach(u => { try { u(); } catch (e) { } });
   A.subs = [];
-  const liviano = ['productos', 'empleados', 'clientes', 'ajustes'];
+  const liviano = ['productos', 'empleados', 'clientes', 'ajustes', 'cuentas'];
   liviano.forEach(col => {
     A.subs.push(A.dbf.collection(col).onSnapshot(sn => {
       sn.docChanges().forEach(ch => aplicarDoc(col, ch.doc.data()));
@@ -175,7 +181,7 @@ function escucharNube() {
   });
   // Histórico reciente (30 días) para no descargar todo
   const desde = now() - 31 * 864e5;
-  ['ventas', 'turnos', 'gastos', 'compras'].forEach(col => {
+  ['ventas', 'turnos', 'gastos', 'compras', 'mermas', 'movs'].forEach(col => {
     A.subs.push(A.dbf.collection(col).where('createdAt', '>=', desde).onSnapshot(sn => {
       sn.docChanges().forEach(ch => aplicarDoc(col, ch.doc.data()));
       guardarLocal(col);
@@ -323,6 +329,102 @@ function leerCodigoBalanza(code) {
   return { cod, peso: null, precio: val };
 }
 
+/* --- Kardex: toda entrada y salida de inventario queda anotada --- */
+function movimiento(p, cant, tipo, ref) {
+  if (!p || !p.id || !cant) return;
+  DB.set('movs', {
+    id: uid(), pid: p.id, nombre: p.nombre, unidad: p.unidad || 'und',
+    cant: Math.round(cant * 1000) / 1000,   // negativo = sale, positivo = entra
+    tipo,                                   // venta | entrada | merma | ajuste | devolucion | anulacion
+    saldo: stockDe(p),                      // existencia que quedó después
+    costo: Number(p.costo) || 0,
+    ref: ref || null, empleado: A.user ? A.user.nombre : '',
+    createdAt: now(), dia: dayKey(), sede: CFG.sede
+  });
+}
+function kardexDe(pid, limite = 60) {
+  return DB.all('movs').filter(m => m.pid === pid)
+    .sort((a, b) => b.createdAt - a.createdAt).slice(0, limite);
+}
+const TIPOMOV = {
+  venta: { n: 'Venta', c: 'var(--ink2)' }, entrada: { n: 'Entrada', c: '#0B9A4E' },
+  merma: { n: 'Merma', c: 'var(--rojo)' }, ajuste: { n: 'Ajuste', c: 'var(--azul)' },
+  devolucion: { n: 'Devolución', c: '#0B9A4E' }, anulacion: { n: 'Anulación', c: 'var(--azul)' }
+};
+
+/* --- Mermas: lo que se daña, se vence o se rompe --- */
+const RAZONES = ['Se dañó', 'Se venció', 'Se rompió', 'Consumo interno', 'Robo o faltante', 'Error de registro'];
+
+function valorMermas(desde, hasta) {
+  return DB.all('mermas').filter(m => m.createdAt >= desde && m.createdAt <= hasta)
+    .reduce((s, m) => s + (Number(m.valor) || 0), 0);
+}
+
+function formMerma(pid) {
+  const ps = catalogo();
+  sheet('Registrar merma', `
+    <p class="muted">Lo que se dañó, se venció o se rompió. Sale del inventario y se cuenta como pérdida en los reportes.</p>
+    <label class="f"><span>Producto</span>
+      <select id="m_p"><option value="">— Elegir —</option>
+      ${ps.map(p => `<option value="${p.id}" ${p.id === pid ? 'selected' : ''}>${esc(p.nombre)} (${p.unidad === 'kg' ? kg(p.stock) : stockDe(p) + ' und'})</option>`).join('')}
+      </select></label>
+    <div class="grid2">
+      <label class="f"><span id="m_lbl">Cantidad</span><input id="m_c" type="number" step="0.001" inputmode="decimal" placeholder="0"></label>
+      <label class="f"><span>Motivo</span>
+        <select id="m_r">${RAZONES.map(r => `<option>${r}</option>`).join('')}</select></label>
+    </div>
+    <div class="card" style="background:var(--rojo-l);border-color:var(--rojo);padding:9px 11px">
+      <div class="between"><span class="tiny" style="color:var(--rojo);font-weight:700">PÉRDIDA EN COSTO</span>
+      <span class="disp num" id="m_v" style="font-size:20px;color:var(--rojo)">$0</span></div>
+    </div>
+    <label class="f" style="margin-top:8px"><span>Nota (opcional)</span><input id="m_n" type="text" placeholder="Ej: caja que llegó golpeada"></label>
+    <button class="btn dan xl" id="m_ok">Registrar merma</button>`, () => {
+    const calc = () => {
+      const p = DB.get('productos', $('#m_p').value);
+      const c = parseFloat($('#m_c').value) || 0;
+      $('#m_lbl').textContent = p && p.unidad === 'kg' ? 'Kilos' : 'Cantidad';
+      $('#m_v').textContent = money(p ? (Number(p.costo) || 0) * c : 0);
+    };
+    $('#m_p').onchange = calc; $('#m_c').oninput = calc; calc();
+    $('#m_ok').onclick = () => {
+      const p = DB.get('productos', $('#m_p').value);
+      const c = parseFloat($('#m_c').value) || 0;
+      if (!p) return toast('Elige el producto', 'warn');
+      if (c <= 0) return toast('Escribe la cantidad', 'warn');
+      p.stock = Math.round(((Number(p.stock) || 0) - c) * 1000) / 1000;
+      DB.set('productos', p);
+      const valor = Math.round((Number(p.costo) || 0) * c);
+      DB.set('mermas', {
+        id: uid(), pid: p.id, nombre: p.nombre, unidad: p.unidad, cant: c, valor,
+        razon: $('#m_r').value, nota: $('#m_n').value.trim(),
+        turnoId: A.turno ? A.turno.id : null, empleado: A.user.nombre,
+        createdAt: now(), dia: dayKey(), sede: CFG.sede
+      });
+      movimiento(p, -c, 'merma', $('#m_r').value);
+      cerrarSheet(); toast('Merma registrada: ' + money(valor), 'warn'); pintar();
+    };
+  });
+}
+
+function vistaMermas() {
+  const ms = DB.all('mermas').sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+  const mes = valorMermas(inicioDia() - 29 * 864e5, now());
+  sheet('Mermas', `
+    <div class="card" style="background:var(--rojo-l);border-color:var(--rojo)">
+      <div class="between"><div><div class="eyebrow" style="color:var(--rojo)">Perdido en 30 días</div>
+      <div class="disp num" style="font-size:26px;color:var(--rojo)">${money(mes)}</div></div>
+      <div class="tiny" style="text-align:right">${ms.length} registro${ms.length === 1 ? '' : 's'}</div></div>
+    </div>
+    <button class="btn dan full" id="mm_new">+ Registrar merma</button>
+    <div class="card tight" style="margin-top:10px">
+      ${ms.length ? ms.map(m => `<div class="item">
+        <div class="g"><div class="t">${esc(m.nombre)}</div>
+        <div class="s">${m.unidad === 'kg' ? kg(m.cant) : m.cant + ' und'} · ${esc(m.razon)} · ${fecha(m.createdAt)}</div></div>
+        <div class="v num" style="color:var(--rojo)">-${money(m.valor)}</div></div>`).join('')
+      : `<div class="empty"><div class="disp">Sin mermas</div><p>Aquí queda lo que se daña o se vence.</p></div>`}
+    </div>`, () => { $('#mm_new').onclick = () => formMerma(); });
+}
+
 /* ---------- 7. CARRITO ---------- */
 function totalLinea(l) {
   if (l.fijo) return redondear(l.fijo);
@@ -361,7 +463,153 @@ function cambiarCant(lid, d) {
   l.cant = Math.max(0, (Number(l.cant) || 0) + d);
   if (l.cant === 0) quitarLinea(lid); else pintar();
 }
-function limpiarCarrito() { A.carrito = []; A.descuento = 0; A.cliente = null; pintar(); }
+function limpiarCarrito() {
+  A.carrito = []; A.descuento = 0; A.cliente = null;
+  if (A.cuenta) guardarCuenta(true);
+  pintar();
+}
+
+/* ---------- 7b. CUENTAS ABIERTAS (mesas) ---------- */
+function cuentasAbiertas() {
+  return DB.all('cuentas').filter(c => c.estado === 'abierta')
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+}
+function totalCuenta(c) {
+  return (c.items || []).reduce((s, l) => s + totalLinea(l), 0);
+}
+function totalAbierto() {
+  return cuentasAbiertas().reduce((s, c) => s + totalCuenta(c), 0);
+}
+
+let _tCta = null;
+function guardarCuenta(ya) {
+  if (!A.cuenta) return;
+  clearTimeout(_tCta);
+  const hacer = () => {
+    const c = DB.get('cuentas', A.cuenta.id);
+    if (!c) return;
+    c.items = A.carrito.map(l => ({ ...l }));
+    c.total = subtotal();
+    c.tocadaAt = now();
+    DB.set('cuentas', c);
+  };
+  ya ? hacer() : (_tCta = setTimeout(hacer, 1000));
+}
+
+function abrirCuenta(id) {
+  const c = DB.get('cuentas', id);
+  if (!c) return toast('Esa cuenta ya no existe', 'err');
+  if (A.cuenta && A.cuenta.id !== id) guardarCuenta(true);
+  else if (!A.cuenta && A.carrito.length) return toast('Termina o vacía la venta actual primero', 'warn', 3500);
+  A.cuenta = c;
+  A.carrito = (c.items || []).map(l => ({ ...l }));
+  A.descuento = 0;
+  A.tab = 'vender';
+  cerrarSheet();
+  pintar();
+  window.scrollTo(0, 0);
+}
+
+function salirCuenta() {
+  guardarCuenta(true);
+  A.cuenta = null;
+  A.carrito = [];
+  A.descuento = 0;
+  pintar();
+  toast('Cuenta guardada', 'ok');
+}
+
+function nuevaCuenta() {
+  const usadas = cuentasAbiertas().map(c => (c.nombre || '').toLowerCase());
+  const mesas = [1, 2, 3, 4, 5, 6].map(n => 'Mesa ' + n).filter(m => !usadas.includes(m.toLowerCase()));
+  sheet('Nueva cuenta', `
+    <p class="muted">Ponle un nombre que te sirva para reconocer quién es. No queda en ningún registro de clientes, es solo para ti.</p>
+    <label class="f"><span>Nombre de referencia</span>
+      <input id="q_n" type="text" placeholder="Ej: Mesa 3, El de la gorra roja"></label>
+    ${mesas.length ? `<div class="eyebrow" style="margin-bottom:6px">O escoge rápido</div>
+    <div class="grid3" style="margin-bottom:12px">
+      ${mesas.map(m => `<button class="btn sm ghost" data-m="${m}">${m}</button>`).join('')}
+    </div>` : ''}
+    <label class="f"><span>Nota (opcional)</span><input id="q_o" type="text" placeholder="Ej: son 4 personas"></label>
+    <button class="btn pri xl" id="q_ok">Abrir la cuenta</button>`, () => {
+    $$('[data-m]').forEach(b => b.onclick = () => { $('#q_n').value = b.dataset.m; });
+    $('#q_ok').onclick = () => {
+      const n = $('#q_n').value.trim();
+      if (!n) return toast('Ponle un nombre de referencia', 'warn');
+      if (cuentasAbiertas().some(c => (c.nombre || '').toLowerCase() === n.toLowerCase()))
+        return toast('Ya hay una cuenta abierta con ese nombre', 'err');
+      const c = DB.set('cuentas', {
+        id: uid(), nombre: n, nota: $('#q_o').value.trim(), estado: 'abierta',
+        items: [], total: 0, createdAt: now(), tocadaAt: now(),
+        empleadoId: A.user.id, empleado: A.user.nombre,
+        turnoId: A.turno ? A.turno.id : null, sede: CFG.sede
+      });
+      abrirCuenta(c.id);
+    };
+    setTimeout(() => $('#q_n').focus(), 150);
+  });
+}
+
+function vistaCuentas() {
+  const cs = cuentasAbiertas();
+  sheet('Cuentas abiertas', `
+    <div class="card" style="background:var(--azul-l);border-color:var(--azul)">
+      <div class="between">
+        <div><div class="eyebrow" style="color:var(--azul-d)">Consumo sin cobrar</div>
+        <div class="disp num" style="font-size:26px">${money(totalAbierto())}</div></div>
+        <div class="tiny" style="text-align:right">${cs.length} cuenta${cs.length === 1 ? '' : 's'}<br>abierta${cs.length === 1 ? '' : 's'}</div>
+      </div>
+    </div>
+    <button class="btn pri full" id="q_new">+ Nueva cuenta</button>
+    <div class="card tight" style="margin-top:10px">
+      ${cs.length ? cs.map(c => `
+        <div class="item" data-abrir="${c.id}" role="button" tabindex="0">
+          <div class="g">
+            <div class="t">${esc(c.nombre)} ${A.cuenta && A.cuenta.id === c.id ? '<span class="bad v">atendiendo</span>' : ''}</div>
+            <div class="s">${(c.items || []).length} producto${(c.items || []).length === 1 ? '' : 's'} · abierta ${hora(c.createdAt)}${c.nota ? ' · ' + esc(c.nota) : ''}</div>
+          </div>
+          <div class="v num">${money(totalCuenta(c))}</div>
+        </div>`).join('')
+      : `<div class="empty"><div class="disp">Sin cuentas abiertas</div>
+         <p>Abre una cuenta para ir anotando lo que consume cada mesa y cobrar al final.</p></div>`}
+    </div>
+    ${cs.length ? `<p class="tiny" style="margin-top:10px">Toca una cuenta para seguir agregándole productos. El inventario se descuenta cuando la cobras, no antes.</p>` : ''}`,
+    (w) => {
+      $('#q_new').onclick = nuevaCuenta;
+      w.querySelectorAll('[data-abrir]').forEach(el => el.onclick = () => abrirCuenta(el.dataset.abrir));
+    });
+}
+
+function modalCuentaOpciones() {
+  const c = A.cuenta;
+  sheet(c.nombre, `
+    <div class="card"><div class="between">
+      <div><div class="eyebrow">Consumo</div><div class="tiny">abierta ${hora(c.createdAt)} · ${esc(c.empleado || '')}</div></div>
+      <div class="disp num" style="font-size:24px">${money(subtotal())}</div></div></div>
+    <div class="stack">
+      <button class="btn full" id="q_ren">Cambiarle el nombre</button>
+      <button class="btn ghost full" id="q_sal">Guardar y salir de la cuenta</button>
+      <button class="btn dan full" id="q_del">Anular la cuenta completa</button>
+    </div>`, () => {
+    $('#q_sal').onclick = () => { cerrarSheet(); salirCuenta(); };
+    $('#q_ren').onclick = () => sheet('Cambiar nombre', `
+      <label class="f"><span>Nombre de referencia</span><input id="r_n" type="text" value="${esc(c.nombre)}"></label>
+      <button class="btn pri xl" id="r_ok">Guardar</button>`, () => {
+      $('#r_ok').onclick = () => {
+        const n = $('#r_n').value.trim();
+        if (!n) return toast('Escribe el nombre', 'warn');
+        c.nombre = n; DB.set('cuentas', c); cerrarSheet(); pintar();
+      };
+    });
+    $('#q_del').onclick = () => confirmar('¿Anular la cuenta de ' + c.nombre + '? Se pierde todo lo anotado y no se cobra nada.', () => {
+      c.estado = 'anulada'; c.anuladaAt = now(); c.anuladaPor = A.user.nombre;
+      DB.set('cuentas', c);
+      clearTimeout(_tCta);
+      A.cuenta = null; A.carrito = []; A.descuento = 0;
+      cerrarSheet(); toast('Cuenta anulada', 'warn'); pintar();
+    }, 'Sí, anular');
+  });
+}
 
 /* ---------- 8. ESCÁNER DE CÓDIGO DE BARRAS ----------
    Un lector USB o Bluetooth se comporta como teclado: escribe rápido
@@ -795,9 +1043,23 @@ function cerrarVenta(pagos, extra = {}) {
     ref: extra.ref || null, clienteId: extra.clienteId || null,
     empleadoId: A.user.id, empleado: A.user.nombre,
     turnoId: A.turno ? A.turno.id : null,
+    cuentaId: A.cuenta ? A.cuenta.id : null,
+    cuenta: A.cuenta ? A.cuenta.nombre : null,
     sede: CFG.sede, estado: 'ok'
   };
   DB.set('ventas', venta);
+
+  // Si venía de una cuenta abierta, se cierra
+  if (A.cuenta) {
+    clearTimeout(_tCta);
+    const c = DB.get('cuentas', A.cuenta.id);
+    if (c) {
+      c.estado = 'cerrada'; c.cerradaAt = now(); c.ventaId = venta.id;
+      c.total = t; c.cobradaPor = A.user.nombre;
+      DB.set('cuentas', c);
+    }
+    A.cuenta = null;
+  }
 
   // Descontar inventario
   items.forEach(i => {
@@ -807,6 +1069,7 @@ function cerrarVenta(pagos, extra = {}) {
     p.stock = Math.round(((Number(p.stock) || 0) - baja) * 1000) / 1000;
     p.vendidos = (Number(p.vendidos) || 0) + baja;
     DB.set('productos', p);
+    movimiento(p, -baja, 'venta', '#' + venta.numero);
   });
 
   // Fiado -> saldo del cliente
@@ -852,6 +1115,7 @@ function textoRecibo(v) {
   if (CFG.tel) L.push('Tel ' + CFG.tel);
   L.push('--------------------------------');
   L.push('Venta #' + v.numero + '  ' + fecha(v.createdAt));
+  if (v.cuenta) L.push('Cuenta: ' + v.cuenta);
   L.push('Atendió: ' + v.empleado);
   L.push('--------------------------------');
   v.items.forEach(i => {
@@ -881,17 +1145,106 @@ function modalRecibo(v) {
       <div class="s">${i.unidad === 'kg' ? kg(i.peso) + ' × ' + money(i.precio) + '/kg' : i.cant + ' × ' + money(i.precio)}</div></div>
       <div class="v num">${money(i.total)}</div></div>`).join('')}</div>
     <div class="grid2">
-      <button class="btn ghost" id="rimp">Imprimir</button>
+      <button class="btn ghost" id="rterm">Imprimir tirilla</button>
       <button class="btn ghost" id="rwa">Enviar por WhatsApp</button>
     </div>
+    <button class="btn ghost sm full" style="margin-top:8px" id="rimp">Imprimir con el navegador</button>
     <button class="btn pri xl" style="margin-top:8px" data-cerrar>Siguiente cliente</button>
   `, () => {
+    $('#rterm').onclick = () => imprimirTermica(ticketTexto(v));
     $('#rimp').onclick = () => imprimirRecibo(v);
     $('#rwa').onclick = () => {
       const txt = encodeURIComponent(textoRecibo(v));
       window.open('https://wa.me/?text=' + txt, '_blank');
     };
   });
+}
+
+/* --- Impresión térmica ESC/POS por RawBT (misma vía que Conty POS) --- */
+const ESC = {
+  ancho: () => Number(CFG.ticketAncho) || 32,
+  linea: (c = '-') => c.repeat(ESC.ancho()),
+  centro: t => {
+    const a = ESC.ancho();
+    t = String(t).slice(0, a);
+    const p = Math.max(0, Math.floor((a - t.length) / 2));
+    return ' '.repeat(p) + t;
+  },
+  // izquierda + derecha en la misma línea
+  lr: (i, d) => {
+    const a = ESC.ancho();
+    i = String(i); d = String(d);
+    if (i.length + d.length + 1 > a) i = i.slice(0, a - d.length - 1);
+    return i + ' '.repeat(Math.max(1, a - i.length - d.length)) + d;
+  },
+  // corta un nombre largo en varias líneas
+  wrap: (t, a) => {
+    a = a || ESC.ancho();
+    const out = []; let l = '';
+    String(t).split(/\s+/).forEach(w => {
+      if ((l + ' ' + w).trim().length > a) { if (l) out.push(l.trim()); l = w; }
+      else l = (l + ' ' + w).trim();
+    });
+    if (l) out.push(l);
+    return out.length ? out : [''];
+  }
+};
+
+function ticketTexto(v) {
+  const L = [];
+  L.push(ESC.centro(CFG.tienda.toUpperCase()));
+  if (CFG.nit) L.push(ESC.centro('NIT ' + CFG.nit));
+  if (CFG.dir) ESC.wrap(CFG.dir).forEach(x => L.push(ESC.centro(x)));
+  if (CFG.tel) L.push(ESC.centro('Tel ' + CFG.tel));
+  L.push(ESC.linea('='));
+  L.push(ESC.lr('Venta #' + v.numero, hora(v.createdAt)));
+  L.push(new Date(v.createdAt).toLocaleDateString('es-CO'));
+  if (v.cuenta) L.push('Cuenta: ' + v.cuenta);
+  L.push('Atendio: ' + v.empleado);
+  L.push(ESC.linea());
+  v.items.forEach(i => {
+    ESC.wrap(i.nombre).forEach(x => L.push(x));
+    const q = i.unidad === 'kg'
+      ? kg(i.peso) + ' x ' + money(i.precio)
+      : i.cant + ' x ' + money(i.precio);
+    L.push(ESC.lr('  ' + q, money(i.total)));
+  });
+  L.push(ESC.linea());
+  if (v.descuento) {
+    L.push(ESC.lr('Subtotal', money(v.subtotal)));
+    L.push(ESC.lr('Descuento', '-' + money(v.descuento)));
+  }
+  const pct = Number(CFG.impPct) || 0;
+  if (pct > 0) {
+    const base = Math.round(v.total / (1 + pct / 100));
+    L.push(ESC.lr('Base', money(base)));
+    L.push(ESC.lr((CFG.impNombre || 'IVA') + ' ' + pct + '%', money(v.total - base)));
+  }
+  L.push(ESC.lr('TOTAL', money(v.total)));
+  (v.pagos || []).forEach(p => L.push(ESC.lr((METODOS.find(m => m.k === p.metodo) || { n: p.metodo }).n, money(p.monto))));
+  if (v.recibido) {
+    L.push(ESC.lr('Recibido', money(v.recibido)));
+    L.push(ESC.lr('Cambio', money(v.cambio)));
+  }
+  L.push(ESC.linea('='));
+  L.push(ESC.centro('Gracias por su compra'));
+  if (CFG.whatsapp) L.push(ESC.centro('WhatsApp ' + CFG.whatsapp));
+  L.push('');
+  L.push('');
+  return L.join('\n');
+}
+
+function imprimirTermica(texto) {
+  try {
+    const url = 'rawbt:' + encodeURIComponent(texto);
+    const a = document.createElement('a');
+    a.href = url; a.style.display = 'none';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => a.remove(), 1500);
+    toast('Enviado a la impresora', 'ok');
+  } catch (e) {
+    toast('No se pudo abrir RawBT. ¿Está instalada?', 'err', 4000);
+  }
 }
 
 function imprimirRecibo(v) {
@@ -901,7 +1254,9 @@ function imprimirRecibo(v) {
     ${CFG.dir ? `<div class="c">${esc(CFG.dir)}</div>` : ''}
     ${CFG.tel ? `<div class="c">Tel ${esc(CFG.tel)}</div>` : ''}
     <div class="d"></div>
-    <div>Venta #${v.numero}</div><div>${fecha(v.createdAt)}</div><div>Atendio: ${esc(v.empleado)}</div>
+    <div>Venta #${v.numero}</div><div>${fecha(v.createdAt)}</div>
+    ${v.cuenta ? `<div>Cuenta: ${esc(v.cuenta)}</div>` : ''}
+    <div>Atendio: ${esc(v.empleado)}</div>
     <div class="d"></div>
     <table>${v.items.map(i => `<tr><td>${esc(i.nombre)}<br>${i.unidad === 'kg' ? kg(i.peso) + ' x ' + money(i.precio) : i.cant + ' x ' + money(i.precio)}</td>
       <td style="text-align:right">${money(i.total)}</td></tr>`).join('')}</table>
@@ -933,6 +1288,22 @@ function vistaVender() {
       placeholder="Escanea o escribe el código">
     <button class="b" id="btncam" aria-label="Leer con cámara">${ICON.cam}</button>
   </div>
+
+  ${A.cuenta ? `
+  <div class="card" style="border-color:var(--azul);border-width:2px;background:var(--azul-l);padding:10px 12px">
+    <div class="between">
+      <div>
+        <div class="eyebrow" style="color:var(--azul-d)">Atendiendo la cuenta</div>
+        <b style="font-size:16px">${esc(A.cuenta.nombre)}</b>
+        <div class="tiny">abierta ${hora(A.cuenta.createdAt)}${A.cuenta.nota ? ' · ' + esc(A.cuenta.nota) : ''}</div>
+      </div>
+      <button class="btn sm ghost" data-act="ctaopc">Opciones</button>
+    </div>
+  </div>` : `
+  <button class="btn ghost full" data-act="cuentas" style="margin-bottom:10px;justify-content:space-between">
+    <span>Cuentas abiertas${cuentasAbiertas().length ? ' (' + cuentasAbiertas().length + ')' : ''}</span>
+    <span class="num" style="color:${totalAbierto() ? 'var(--azul-d)' : 'var(--ink3)'}">${totalAbierto() ? money(totalAbierto()) : 'ninguna'}</span>
+  </button>`}
 
   ${!A.turno ? `<div class="card" style="border-color:var(--rosa);background:var(--rosa-l)">
     <div class="between"><div><b>La caja está cerrada</b><div class="tiny">Ábrela para poder vender.</div></div>
@@ -967,8 +1338,8 @@ function vistaVender() {
     <button class="btn sm dan" data-act="vaciar">Vaciar</button>
   </div>` : `
   <div class="card empty">
-    <div class="disp">Listo para vender</div>
-    <p>Escanea un producto o búscalo abajo. Si es fruta o verdura, te pedimos el peso.</p>
+    <div class="disp">${A.cuenta ? esc(A.cuenta.nombre) + ' sin consumo' : 'Listo para vender'}</div>
+    <p>${A.cuenta ? 'Ve anotando lo que pida. Se guarda solo, y cobras cuando se vayan.' : 'Escanea un producto o búscalo abajo. Si es fruta o verdura, te pedimos el peso.'}</p>
     <button class="btn sm ghost" id="btncam2">Leer con la cámara</button>
   </div>`}
 
@@ -1002,16 +1373,19 @@ function vistaVender() {
 }
 
 function tirilla() {
-  if (!A.carrito.length) return '';
+  if (!A.carrito.length && !A.cuenta) return '';
   const t = total();
   return `<div class="tirilla">
     <div class="between">
       <div>
-        <div class="lbl">Total</div>
+        <div class="lbl">${A.cuenta ? 'Cuenta · ' + esc(A.cuenta.nombre) : 'Total'}</div>
         <div class="tot"><small>$</small>${Math.round(t).toLocaleString('es-CO')}</div>
-        <div class="meta">${unidadesCarrito()} unid · ${A.carrito.length} líneas${A.descuento ? ' · desc ' + money(A.descuento) : ''}${A.cliente ? ' · ' + esc(A.cliente.nombre) : ''}</div>
+        <div class="meta">${unidadesCarrito()} unid · ${A.carrito.length} líneas${A.descuento ? ' · desc ' + money(A.descuento) : ''}${A.cliente ? ' · ' + esc(A.cliente.nombre) : ''}${A.cuenta ? ' · se guarda solo' : ''}</div>
       </div>
-      <button class="btn acc" style="min-height:54px;padding:0 22px;font-size:17px" data-act="cobrar">COBRAR</button>
+      <div style="display:flex;gap:6px;flex:none">
+        ${A.cuenta ? `<button class="btn" style="min-height:54px;padding:0 12px;background:transparent;border-color:#4E7CA8;color:#fff;font-size:13px" data-act="salircta">Salir</button>` : ''}
+        <button class="btn acc" style="min-height:54px;padding:0 18px;font-size:17px" data-act="cobrar" ${!A.carrito.length ? 'disabled' : ''}>COBRAR</button>
+      </div>
     </div>
   </div>`;
 }
@@ -1037,9 +1411,10 @@ function vistaInventario() {
 
   ${panelPedir()}
 
-  <div class="grid2" style="margin-bottom:10px">
+  <div class="grid3" style="margin-bottom:10px">
     <button class="btn pri" data-act="nuevoprod">+ Producto</button>
-    <button class="btn" data-act="entrada">Entrada de mercancía</button>
+    <button class="btn" data-act="entrada">Entrada</button>
+    <button class="btn ghost" data-act="mermas" style="color:var(--rojo);border-color:var(--rojo-l)">Mermas</button>
   </div>
 
   <input id="busca" type="text" placeholder="Buscar por nombre o código" value="${esc(A.filtro)}" style="margin-bottom:8px">
@@ -1116,6 +1491,35 @@ function panelPedir() {
   </div>`;
 }
 
+function vistaKardex(pid) {
+  const p = DB.get('productos', pid); if (!p) return;
+  const ms = kardexDe(pid);
+  const u = p.unidad === 'kg' ? 'kg' : 'und';
+  const vendido = ms.filter(m => m.tipo === 'venta').reduce((s, m) => s + Math.abs(m.cant), 0);
+  const merma = ms.filter(m => m.tipo === 'merma').reduce((s, m) => s + Math.abs(m.cant), 0);
+  sheet('Movimientos · ' + p.nombre, `
+    <div class="grid3" style="margin-bottom:10px">
+      <div class="kpi"><div class="k num" style="font-size:17px">${p.unidad === 'kg' ? kg(p.stock) : stockDe(p)}</div><div class="l">Hay ahora</div></div>
+      <div class="kpi g"><div class="k num" style="font-size:17px">${Math.round(vendido * 100) / 100}</div><div class="l">Vendido</div></div>
+      <div class="kpi r"><div class="k num" style="font-size:17px">${Math.round(merma * 100) / 100}</div><div class="l">Merma</div></div>
+    </div>
+    <div class="card tight">
+      ${ms.length ? ms.map(m => {
+        const t = TIPOMOV[m.tipo] || { n: m.tipo, c: 'var(--ink2)' };
+        const ent = m.cant > 0;
+        return `<div class="item">
+          <div class="g"><div class="t" style="color:${t.c}">${t.n}${m.ref ? ' · ' + esc(m.ref) : ''}</div>
+          <div class="s">${fecha(m.createdAt)}${m.empleado ? ' · ' + esc(m.empleado) : ''}</div></div>
+          <div style="text-align:right">
+            <div class="v num" style="color:${ent ? '#0B9A4E' : 'var(--rojo)'}">${ent ? '+' : ''}${Math.round(m.cant * 1000) / 1000}</div>
+            <div class="tiny num">quedó ${Math.round((m.saldo || 0) * 100) / 100} ${u}</div>
+          </div></div>`;
+      }).join('')
+      : `<div class="empty"><p>Sin movimientos todavía. Desde ahora queda anotada cada venta, entrada y merma.</p></div>`}
+    </div>
+    ${ms.length >= 60 ? '<p class="tiny" style="margin-top:8px">Mostrando los 60 más recientes.</p>' : ''}`);
+}
+
 function margen(p) {
   const pr = Number(p.precio) || 0, c = Number(p.costo) || 0;
   if (!pr) return 0;
@@ -1171,7 +1575,11 @@ function formProducto(pre = {}) {
     <div class="inline-check"><input type="checkbox" id="f_fav" ${p.favorito ? 'checked' : ''}><label for="f_fav">Mostrarlo como botón rápido al vender</label></div>
     <div class="inline-check"><input type="checkbox" id="f_act" ${p.activo !== false ? 'checked' : ''}><label for="f_act">Activo (aparece al vender)</label></div>
     <button class="btn pri xl" style="margin-top:10px" id="f_ok">Guardar producto</button>
-    ${p.id ? `<button class="btn dan full" style="margin-top:8px" id="f_del">Eliminar producto</button>` : ''}
+    ${p.id ? `<div class="grid2" style="margin-top:8px">
+      <button class="btn ghost" id="f_kar">Ver movimientos</button>
+      <button class="btn ghost" id="f_mer" style="color:var(--rojo);border-color:var(--rojo-l)">Registrar merma</button>
+    </div>
+    <button class="btn dan full" style="margin-top:8px" id="f_del">Eliminar producto</button>` : ''}
   `, () => {
     const sync = () => {
       const kgm = $('#f_unidad').value === 'kg';
@@ -1209,6 +1617,8 @@ function formProducto(pre = {}) {
         const dup = DB.all('productos').find(x => x.id !== p.id && String(x.barcode || '') === bc);
         if (dup) return toast('Ese código ya lo tiene: ' + dup.nombre, 'err', 3500);
       }
+      const stockAntes = Number(p.stock) || 0;
+      const stockNuevo = parseFloat($('#f_stock').value) || 0;
       const guardado = DB.set('productos', {
         ...p, nombre, barcode: bc, plu: $('#f_plu').value.trim(),
         unidad: $('#f_unidad').value,
@@ -1219,10 +1629,16 @@ function formProducto(pre = {}) {
         favorito: $('#f_fav').checked, activo: $('#f_act').checked,
         conFoto: fotoNueva !== undefined ? !!fotoNueva : !!fotoDe(p.id)
       });
+      if (p.id && Math.abs(stockNuevo - stockAntes) > 0.0001)
+        movimiento(guardado, stockNuevo - stockAntes, 'ajuste', 'corregido a mano');
       if (fotoNueva) DB.set('fotos', { id: guardado.id, d: fotoNueva });
       else if (fotoNueva === null) DB.del('fotos', guardado.id);
       cerrarSheet(); toast('Producto guardado', 'ok'); pintar();
     };
+    if (p.id) {
+      $('#f_kar').onclick = () => vistaKardex(p.id);
+      $('#f_mer').onclick = () => formMerma(p.id);
+    }
     if (p.id) $('#f_del').onclick = () => confirmar('¿Eliminar "' + p.nombre + '" del inventario?', () => {
       DB.del('productos', p.id); DB.del('fotos', p.id);
       cerrarSheet(); toast('Producto eliminado'); pintar();
@@ -1277,6 +1693,7 @@ function formEntrada() {
         p.stock = Math.round(((Number(p.stock) || 0) + it.cant) * 1000) / 1000;
         if (it.costo > 0) p.costo = it.costo;
         DB.set('productos', p);
+        movimiento(p, it.cant, 'entrada', $('#e_prov').value.trim() || null);
         costoTotal += (it.costo || Number(p.costo) || 0) * it.cant;
       });
       DB.set('compras', {
@@ -1343,6 +1760,7 @@ function gastosDeTurno(tid) { return DB.all('gastos').filter(g => g.turnoId === 
 
 function resumenTurno(t) {
   const vs = ventasDeTurno(t.id), gs = gastosDeTurno(t.id);
+  const mer = DB.all('mermas').filter(m => m.turnoId === t.id).reduce((s, m) => s + (Number(m.valor) || 0), 0);
   const porMetodo = {};
   vs.forEach(v => (v.pagos || []).forEach(p => porMetodo[p.metodo] = (porMetodo[p.metodo] || 0) + p.monto));
   const efectivo = porMetodo.efectivo || 0;
@@ -1350,7 +1768,7 @@ function resumenTurno(t) {
   const totalVentas = vs.reduce((s, v) => s + v.total, 0);
   const utilidad = vs.reduce((s, v) => s + (v.utilidad || 0), 0);
   return {
-    vs, gs, porMetodo, efectivo, gastado, totalVentas, utilidad,
+    vs, gs, porMetodo, efectivo, gastado, totalVentas, utilidad, merma: mer,
     esperado: (Number(t.base) || 0) + efectivo - gastado
   };
 }
@@ -1390,12 +1808,32 @@ function vistaCaja() {
     </div>
   </div>
 
+  ${Number(CFG.metaDiaria) > 0 ? (() => {
+    const hoyV = rangoVentas(inicioDia(), now()).filter(v => !v.esAbono).reduce((s, v) => s + v.total, 0);
+    const pc = Math.min(100, Math.round(hoyV / Number(CFG.metaDiaria) * 100));
+    return `<div class="card">
+      <div class="between"><h3>Meta de hoy</h3>
+      <span class="bad ${pc >= 100 ? 'v' : 'n'}">${pc}%</span></div>
+      <div class="bar" style="height:11px"><i style="width:${pc}%;background:${pc >= 100 ? '#0B9A4E' : 'var(--rosa)'}"></i></div>
+      <div class="tiny" style="margin-top:6px">${money(hoyV)} de ${money(CFG.metaDiaria)}${pc < 100 ? ' · faltan ' + money(Number(CFG.metaDiaria) - hoyV) : ' · ¡meta cumplida!'}</div>
+    </div>`;
+  })() : ''}
+
   <div class="grid2" style="margin-bottom:10px">
     <div class="kpi g"><div class="k num">${money(r.totalVentas)}</div><div class="l">Vendido</div></div>
     <div class="kpi"><div class="k num">${r.vs.length}</div><div class="l">Ventas</div></div>
     <div class="kpi o"><div class="k num">${money(r.efectivo)}</div><div class="l">En efectivo</div></div>
     <div class="kpi r"><div class="k num">${money(r.gastado)}</div><div class="l">Gastos</div></div>
   </div>
+
+  ${cuentasAbiertas().length ? `<div class="card" style="border-color:var(--azul);background:var(--azul-l)">
+    <div class="between">
+      <div><div class="eyebrow" style="color:var(--azul-d)">Cuentas abiertas sin cobrar</div>
+      <b style="font-size:14px">${cuentasAbiertas().map(c => esc(c.nombre)).join(', ')}</b></div>
+      <span class="disp num" style="font-size:22px">${money(totalAbierto())}</span>
+    </div>
+    <div class="tiny" style="margin-top:6px">Esta plata todavía no entró a la caja ni cuenta como venta.</div>
+  </div>` : ''}
 
   <div class="card">
     <div class="between"><h3>Debe haber en caja</h3>
@@ -1411,9 +1849,10 @@ function vistaCaja() {
       : '<p class="muted" style="margin:0">Sin ventas todavía.</p>'}
   </div>
 
-  <div class="grid2" style="margin-bottom:10px">
-    <button class="btn" data-act="gasto">Registrar gasto</button>
-    <button class="btn ghost" data-act="verventas">Ver ventas del turno</button>
+  <div class="grid3" style="margin-bottom:10px">
+    <button class="btn" data-act="gasto">Gasto</button>
+    <button class="btn ghost" data-act="mermas" style="color:var(--rojo);border-color:var(--rojo-l)">Merma</button>
+    <button class="btn ghost" data-act="verventas">Ventas</button>
   </div>
   <button class="btn dark xl" data-act="cerrarcaja">Cerrar caja y cuadrar</button>`;
 }
@@ -1442,6 +1881,7 @@ function modalAbrirCaja() {
 }
 
 function modalGasto() {
+  let reciboFoto = null;
   sheet('Registrar gasto', `
     <p class="muted">Plata que sale de la caja: domicilios, bolsas, arreglos, etc.</p>
     <label class="f"><span>¿En qué se gastó?</span><input id="g_con" type="text" placeholder="Ej: Bolsas plásticas"></label>
@@ -1449,34 +1889,90 @@ function modalGasto() {
     <label class="f"><span>Categoría</span>
       <select id="g_cat">
         <option>Mercancía</option><option>Servicios</option><option>Transporte</option>
-        <option>Aseo</option><option>Nómina</option><option>Otro</option>
+        <option>Aseo</option><option>Nómina</option><option>Arriendo</option><option>Otro</option>
       </select></label>
-    <button class="btn pri xl" id="g_ok">Guardar gasto</button>`, () => {
+    <div class="eyebrow" style="margin-bottom:6px">¿Qué tipo de gasto es?</div>
+    <div class="grid2" style="margin-bottom:10px">
+      <button class="btn sm dark" data-tipo="variable" id="g_tv">Variable<br><span class="tiny" style="font-weight:400;opacity:.8">cambia cada día</span></button>
+      <button class="btn sm ghost" data-tipo="fijo" id="g_tf">Fijo<br><span class="tiny" style="font-weight:400;opacity:.8">se paga siempre igual</span></button>
+    </div>
+    <div class="card" style="padding:10px 12px">
+      <div class="row" style="align-items:flex-start">
+        <div id="g_prev" class="thb ph">📄</div>
+        <div style="flex:1">
+          <div class="eyebrow">Foto del recibo</div>
+          <p class="tiny" style="margin:4px 0 8px">Opcional. Sirve para cuadrar después con el contador.</p>
+          <div class="row" style="gap:6px">
+            <label class="btn sm ghost fotolbl" for="g_cam">Tomar foto</label>
+            <label class="btn sm ghost fotolbl" for="g_gal">Galería</label>
+          </div>
+        </div>
+      </div>
+      <input id="g_cam" class="hidden" type="file" accept="image/*" capture="environment">
+      <input id="g_gal" class="hidden" type="file" accept="image/*">
+    </div>
+    <button class="btn pri xl" style="margin-top:10px" id="g_ok">Guardar gasto</button>`, () => {
+    let tipo = 'variable';
+    $('#g_tv').onclick = () => { tipo = 'variable'; $('#g_tv').className = 'btn sm dark'; $('#g_tf').className = 'btn sm ghost'; };
+    $('#g_tf').onclick = () => { tipo = 'fijo'; $('#g_tf').className = 'btn sm dark'; $('#g_tv').className = 'btn sm ghost'; };
+    const cargar = async (inp) => {
+      const f = inp.files && inp.files[0]; if (!f) return;
+      try {
+        reciboFoto = await comprimirFoto(f, 520, 0.6);
+        $('#g_prev').outerHTML = `<img id="g_prev" class="thb" src="${reciboFoto}" alt="">`;
+        toast('Recibo adjuntado', 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      inp.value = '';
+    };
+    $('#g_cam').onchange = () => cargar($('#g_cam'));
+    $('#g_gal').onchange = () => cargar($('#g_gal'));
     $('#g_ok').onclick = () => {
       const monto = parseFloat($('#g_mon').value) || 0;
       const con = $('#g_con').value.trim();
       if (!con) return toast('Escribe en qué se gastó', 'warn');
       if (monto <= 0) return toast('Escribe el monto', 'warn');
-      DB.set('gastos', {
+      const g = DB.set('gastos', {
         id: uid(), createdAt: now(), dia: dayKey(), concepto: con, monto,
-        categoria: $('#g_cat').value, turnoId: A.turno ? A.turno.id : null,
+        categoria: $('#g_cat').value, tipo,
+        conRecibo: !!reciboFoto,
+        turnoId: A.turno ? A.turno.id : null,
         empleado: A.user.nombre, sede: CFG.sede
       });
+      if (reciboFoto) DB.set('fotos', { id: 'g_' + g.id, d: reciboFoto });
       cerrarSheet(); toast('Gasto registrado', 'ok'); pintar();
     };
     setTimeout(() => $('#g_con').focus(), 150);
   });
 }
 
+function verRecibo(gid) {
+  const g = DB.get('gastos', gid); if (!g) return;
+  const f = fotoDe('g_' + gid);
+  sheet(g.concepto, `
+    <div class="card"><div class="between">
+      <div><div class="eyebrow">${esc(g.categoria || '')} · ${g.tipo === 'fijo' ? 'fijo' : 'variable'}</div>
+      <div class="tiny">${fecha(g.createdAt)} · ${esc(g.empleado || '')}</div></div>
+      <div class="disp num" style="font-size:24px;color:var(--rojo)">-${money(g.monto)}</div></div></div>
+    ${f ? `<img src="${f}" alt="Recibo" style="width:100%;border-radius:var(--r2);border:1px solid var(--line);display:block">`
+       : `<div class="card empty"><p>Este gasto no tiene foto del recibo.</p></div>`}`);
+}
+
 function modalCerrarCaja() {
   const t = A.turno, r = resumenTurno(t);
+  const abiertas = cuentasAbiertas();
   sheet('Cerrar caja', `
+    ${abiertas.length ? `<div class="card" style="border-color:var(--rosa);border-width:2px;background:var(--rosa-l)">
+      <b>Ojo: hay ${abiertas.length} cuenta${abiertas.length === 1 ? '' : 's'} sin cobrar</b>
+      <div class="tiny" style="margin-top:4px">${abiertas.map(c => esc(c.nombre) + ' (' + money(totalCuenta(c)) + ')').join(', ')}.
+      Si cierras la caja ahora, ese consumo queda pendiente para el otro turno.</div>
+    </div>` : ''}
     <div class="card">
       <div class="between"><span class="eyebrow">Debe haber en caja</span>
       <span class="disp num" style="font-size:24px">${money(r.esperado)}</span></div>
     </div>
     <label class="f"><span>Cuenta la plata y escribe cuánto hay de verdad</span>
       <input id="z_con" type="number" inputmode="numeric" placeholder="0" style="font-size:24px;font-weight:700"></label>
+    <button class="btn ghost sm full" id="z_arq" style="margin-bottom:12px">Contar billete por billete</button>
     <div class="card" id="z_box" style="background:var(--line2)">
       <div class="between"><span class="eyebrow">Diferencia</span>
       <span class="disp num" id="z_dif" style="font-size:26px">$0</span></div>
@@ -1493,6 +1989,7 @@ function modalCerrarCaja() {
       else if (d < 0) { box.style.background = 'var(--rojo-l)'; msg.textContent = 'Falta plata en la caja.'; }
       else { box.style.background = 'var(--rosa-l)'; msg.textContent = 'Hay más plata de la esperada.'; }
     };
+    $('#z_arq').onclick = () => modalArqueo(v => { inp.value = v; inp.oninput(); });
     $('#z_ok').onclick = () => {
       const c = parseFloat(inp.value);
       if (isNaN(c)) return toast('Escribe cuánto contaste', 'warn');
@@ -1500,7 +1997,7 @@ function modalCerrarCaja() {
         ...t, estado: 'cerrado', cerradoAt: now(), conteo: c,
         diferencia: c - r.esperado, esperado: r.esperado,
         totalVentas: r.totalVentas, numVentas: r.vs.length,
-        efectivo: r.efectivo, gastos: r.gastado, utilidad: r.utilidad,
+        efectivo: r.efectivo, gastos: r.gastado, utilidad: r.utilidad, merma: r.merma,
         porMetodo: r.porMetodo, obs: $('#z_obs').value.trim(),
         cerradoPor: A.user.nombre
       };
@@ -1513,6 +2010,67 @@ function modalCerrarCaja() {
   });
 }
 
+const DENOM = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50];
+
+function modalFijos() {
+  sheet('Mis gastos fijos', `
+    <p class="muted">Lo que pagas todos los meses pase lo que pase. Con esto la app calcula cuánto tienes que vender al día para no perder plata.</p>
+    <label class="f"><span>Total de gastos fijos al mes</span>
+      <input id="pf_m" type="number" inputmode="numeric" value="${CFG.gastosFijosMes || ''}" placeholder="0" style="font-size:22px;font-weight:700"></label>
+    <div class="card" style="background:var(--line2);padding:10px 12px">
+      <div class="tiny"><b>Qué va aquí:</b> arriendo, servicios (agua, luz, internet), nómina fija, seguridad social, plan de datos, software, cuota del local.<br>
+      <b>Qué NO:</b> la mercancía que compras (esa ya está en el costo) ni los gastos del día a día.</div>
+    </div>
+    <label class="f" style="margin-top:10px"><span>Meta de venta diaria (opcional)</span>
+      <input id="pf_d" type="number" inputmode="numeric" value="${CFG.metaDiaria || ''}" placeholder="0"></label>
+    <button class="btn pri xl" id="pf_ok">Guardar</button>`, () => {
+    $('#pf_ok').onclick = () => {
+      DB.cfg({ gastosFijosMes: parseFloat($('#pf_m').value) || 0, metaDiaria: parseFloat($('#pf_d').value) || 0 });
+      cerrarSheet(); toast('Guardado', 'ok'); pintar();
+    };
+    setTimeout(() => $('#pf_m').focus(), 150);
+  });
+}
+
+function modalArqueo(alTerminar) {
+  sheet('Contar la caja', `
+    <p class="muted">Escribe cuántos billetes y monedas hay de cada uno. La app suma sola.</p>
+    <div id="arq" class="card tight">
+      ${DENOM.map(d => `<div class="item" style="padding:7px 10px">
+        <div class="g"><div class="t num">${money(d)}</div></div>
+        <button class="btn sm ghost" data-d="${d}" data-s="-1" style="min-width:36px">−</button>
+        <input class="num" type="number" inputmode="numeric" data-den="${d}" value="0"
+          style="width:58px;text-align:center;padding:7px 4px;font-weight:700">
+        <button class="btn sm ghost" data-d="${d}" data-s="1" style="min-width:36px">+</button>
+        <div class="v num" data-sub="${d}" style="min-width:72px">$0</div>
+      </div>`).join('')}
+    </div>
+    <div class="card" style="background:var(--ink);color:#fff;border:none;margin-top:10px">
+      <div class="between"><span class="eyebrow" style="color:#9EC5E6">Total contado</span>
+      <span class="disp num" id="arq_t" style="font-size:28px">$0</span></div>
+    </div>
+    <button class="btn pri xl" style="margin-top:10px" id="arq_ok">Usar este total</button>`, () => {
+    const calc = () => {
+      let t = 0;
+      $$('#arq [data-den]').forEach(i => {
+        const d = Number(i.dataset.den), n = Math.max(0, parseInt(i.value) || 0);
+        i.value = n; const sub = d * n; t += sub;
+        $(`#arq [data-sub="${d}"]`).textContent = sub ? money(sub) : '$0';
+      });
+      $('#arq_t').textContent = money(t);
+      return t;
+    };
+    $('#arq').oninput = calc;
+    $('#arq').onclick = e => {
+      const b = e.target.closest('[data-s]'); if (!b) return;
+      const i = $(`#arq [data-den="${b.dataset.d}"]`);
+      i.value = Math.max(0, (parseInt(i.value) || 0) + Number(b.dataset.s));
+      calc();
+    };
+    $('#arq_ok').onclick = () => { const t = calc(); cerrarSheet(); alTerminar(t); };
+  });
+}
+
 function modalResumenTurno(t) {
   const dif = Number(t.diferencia) || 0;
   const txt = [
@@ -1522,6 +2080,7 @@ function modalResumenTurno(t) {
     '--------------------------------',
     'Ventas: ' + (t.numVentas || 0) + '  (' + money(t.totalVentas) + ')',
     'Utilidad: ' + money(t.utilidad || 0),
+    (t.merma ? 'Mermas: -' + money(t.merma) : ''),
     'Base: ' + money(t.base),
     'Efectivo: ' + money(t.efectivo),
     'Gastos: -' + money(t.gastos),
@@ -1539,6 +2098,7 @@ function modalResumenTurno(t) {
     </div>
     <div class="card tight">
       ${[['Ventas', (t.numVentas || 0) + ' · ' + money(t.totalVentas)], ['Utilidad', money(t.utilidad || 0)],
+      ...(t.merma ? [['Mermas', '-' + money(t.merma)]] : []),
       ['Base', money(t.base)], ['Efectivo recibido', money(t.efectivo)], ['Gastos', '-' + money(t.gastos)],
       ['Debía haber', money(t.esperado)], ['Contado', money(t.conteo)]]
       .map(([a, b]) => `<div class="item"><div class="g"><div class="t">${a}</div></div><div class="v num">${b}</div></div>`).join('')}
@@ -1576,16 +2136,18 @@ function modalDetalleVenta(v) {
       <div class="t">${esc(i.nombre)}</div><div class="s num">${i.unidad === 'kg' ? kg(i.peso) : i.cant + ' und'} × ${money(i.precio)}</div></div>
       <div class="v num">${money(i.total)}</div></div>`).join('')}</div>
     <div class="grid2">
-      <button class="btn ghost" id="d_imp">Imprimir</button>
+      <button class="btn ghost" id="d_imp">Imprimir tirilla</button>
       <button class="btn dan" id="d_anu" ${v.estado === 'anulada' ? 'disabled' : ''}>Anular venta</button>
     </div>`, () => {
-    $('#d_imp').onclick = () => imprimirRecibo(v);
+    $('#d_imp').onclick = () => imprimirTermica(ticketTexto(v));
     $('#d_anu').onclick = () => confirmar('¿Anular la venta #' + v.numero + '? El inventario se devuelve.', () => {
       v.items.forEach(i => {
         if (!i.pid) return;
         const p = DB.get('productos', i.pid); if (!p) return;
-        p.stock = Math.round(((Number(p.stock) || 0) + (i.unidad === 'kg' ? (i.peso || 0) : i.cant)) * 1000) / 1000;
+        const dev = i.unidad === 'kg' ? (i.peso || 0) : i.cant;
+        p.stock = Math.round(((Number(p.stock) || 0) + dev) * 1000) / 1000;
         DB.set('productos', p);
+        movimiento(p, dev, 'anulacion', '#' + v.numero);
       });
       v.estado = 'anulada'; v.anuladaPor = A.user.nombre; v.anuladaAt = now();
       DB.set('ventas', v);
@@ -1609,62 +2171,146 @@ function limitesRango() {
   return [inicioDia() - 29 * 864e5, h];
 }
 
+/* --- Resumen de un rango: la base de todos los indicadores --- */
+function resumen(desde, hasta) {
+  const vs = rangoVentas(desde, hasta).filter(v => !v.esAbono);
+  const abonos = rangoVentas(desde, hasta).filter(v => v.esAbono);
+  const gs = DB.all('gastos').filter(g => g.createdAt >= desde && g.createdAt <= hasta);
+  const ms = DB.all('mermas').filter(x => x.createdAt >= desde && x.createdAt <= hasta);
+
+  const ventas = vs.reduce((s, v) => s + v.total, 0);
+  const costo = vs.reduce((s, v) => s + (v.costo || 0), 0);
+  const bruta = ventas - costo;
+  const fijos = gs.filter(g => g.tipo === 'fijo').reduce((s, g) => s + (Number(g.monto) || 0), 0);
+  const variables = gs.filter(g => g.tipo !== 'fijo').reduce((s, g) => s + (Number(g.monto) || 0), 0);
+  const merma = ms.reduce((s, x) => s + (Number(x.valor) || 0), 0);
+  const dias = Math.max(1, Math.ceil((hasta - desde) / 864e5));
+
+  return {
+    vs, gs, ms, abonos, dias,
+    ventas, costo, bruta, fijos, variables, merma,
+    gastos: fijos + variables,
+    neta: bruta - fijos - variables - merma,
+    tickets: vs.length,
+    ticket: vs.length ? ventas / vs.length : 0,
+    margen: ventas ? (bruta / ventas) * 100 : 0,
+    unidades: vs.reduce((s, v) => s + v.items.length, 0),
+    cobradoAbonos: abonos.reduce((s, v) => s + v.total, 0)
+  };
+}
+
+function flecha(hoy, antes) {
+  if (!antes) return '';
+  const p = Math.round(((hoy - antes) / antes) * 100);
+  if (!isFinite(p) || p === 0) return '<span class="tiny" style="color:var(--ink3)">igual</span>';
+  const sube = p > 0;
+  return `<span class="tiny num" style="color:${sube ? '#0B9A4E' : 'var(--rojo)'};font-weight:700">${sube ? '▲' : '▼'} ${Math.abs(p)}%</span>`;
+}
+
 function vistaReportes() {
   const [d, hs] = limitesRango();
-  const vs = rangoVentas(d, hs);
-  const gs = DB.all('gastos').filter(g => g.createdAt >= d && g.createdAt <= hs);
-  const totalV = vs.reduce((s, v) => s + v.total, 0);
-  const util = vs.reduce((s, v) => s + (v.utilidad || 0), 0);
-  const gasto = gs.reduce((s, g) => s + (Number(g.monto) || 0), 0);
-  const ticket = vs.length ? totalV / vs.length : 0;
+  const r = resumen(d, hs);
+  const dur = hs - d;
+  const ant = resumen(d - dur - 1, d - 1);   // mismo periodo anterior, para comparar
 
   // top productos
   const top = {};
-  vs.forEach(v => v.items.forEach(i => {
+  r.vs.forEach(v => v.items.forEach(i => {
     const k = i.nombre;
-    top[k] = top[k] || { n: k, q: 0, v: 0 };
+    top[k] = top[k] || { n: k, q: 0, v: 0, c: 0 };
     top[k].q += i.unidad === 'kg' ? (i.peso || 0) : i.cant;
     top[k].v += i.total;
+    top[k].c += (i.costo || 0) * (i.unidad === 'kg' ? (i.peso || 0) : i.cant);
   }));
   const tops = Object.values(top).sort((a, b) => b.v - a.v).slice(0, 10);
   const maxV = tops.length ? tops[0].v : 1;
+  const porGanancia = Object.values(top).map(t => ({ ...t, g: t.v - t.c })).sort((a, b) => b.g - a.g).slice(0, 5);
 
-  // por método
-  const met = {};
-  vs.forEach(v => (v.pagos || []).forEach(p => met[p.metodo] = (met[p.metodo] || 0) + p.monto));
+  // por hora del día
+  const horas = Array(24).fill(0);
+  r.vs.forEach(v => { horas[new Date(v.createdAt).getHours()] += v.total; });
+  const maxH = Math.max(1, ...horas);
+  const pico = horas.indexOf(maxH);
+  const rangoH = horas.map((v, i) => ({ i, v })).filter(x => x.v > 0);
 
-  // por empleado
-  const emp = {};
-  vs.forEach(v => { emp[v.empleado] = (emp[v.empleado] || 0) + v.total; });
+  // por día de la semana
+  const DIAS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+  const sem = Array(7).fill(0);
+  r.vs.forEach(v => { sem[new Date(v.createdAt).getDay()] += v.total; });
+  const maxS = Math.max(1, ...sem);
 
-  // por día (para ver tendencia)
-  const dias = {};
-  vs.forEach(v => { const k = v.dia || dayKey(v.createdAt); dias[k] = (dias[k] || 0) + v.total; });
-  const dl = Object.entries(dias).sort((a, b) => a[0].localeCompare(b[0]));
-  const maxD = Math.max(1, ...dl.map(x => x[1]));
+  // métodos y empleados
+  const met = {}; r.vs.forEach(v => (v.pagos || []).forEach(p => met[p.metodo] = (met[p.metodo] || 0) + p.monto));
+  const emp = {}; r.vs.forEach(v => { emp[v.empleado] = (emp[v.empleado] || 0) + v.total; });
+
+  // punto de equilibrio
+  const fijoMes = Number(CFG.gastosFijosMes) || 0;
+  const fijoDia = fijoMes / 30;
+  const margenU = r.margen / 100;
+  const equilibrioDia = margenU > 0 ? fijoDia / margenU : 0;
+  const ventaDia = r.ventas / r.dias;
+  const avance = equilibrioDia > 0 ? Math.min(100, Math.round((ventaDia / equilibrioDia) * 100)) : 0;
 
   return `
-  <div class="row" style="gap:6px;margin-bottom:10px;overflow-x:auto;padding-bottom:4px">
+  <div class="cats">
     ${[['hoy', 'Hoy'], ['ayer', 'Ayer'], ['semana', '7 días'], ['mes', '30 días']]
       .map(([k, n]) => `<button class="btn sm ${repRango === k ? 'dark' : 'ghost'}" data-rango="${k}">${n}</button>`).join('')}
   </div>
 
   <div class="grid2" style="margin-bottom:10px">
-    <div class="kpi g"><div class="k num">${money(totalV)}</div><div class="l">Ventas</div></div>
-    <div class="kpi"><div class="k num">${vs.length}</div><div class="l">Tickets</div></div>
-    <div class="kpi o"><div class="k num">${money(util)}</div><div class="l">Utilidad bruta</div></div>
-    <div class="kpi r"><div class="k num">${money(gasto)}</div><div class="l">Gastos</div></div>
+    <div class="kpi g"><div class="k num">${money(r.ventas)}</div><div class="l">Ventas ${flecha(r.ventas, ant.ventas)}</div></div>
+    <div class="kpi"><div class="k num">${r.tickets}</div><div class="l">Tickets ${flecha(r.tickets, ant.tickets)}</div></div>
+    <div class="kpi o"><div class="k num">${money(r.ticket)}</div><div class="l">Ticket promedio ${flecha(r.ticket, ant.ticket)}</div></div>
+    <div class="kpi"><div class="k num">${Math.round(r.margen)}%</div><div class="l">Margen ${flecha(r.margen, ant.margen)}</div></div>
   </div>
 
-  <div class="card">
-    <div class="between"><h3>Ganancia después de gastos</h3>
-    <span class="disp num" style="font-size:24px;color:${util - gasto >= 0 ? 'var(--azul)' : 'var(--rojo)'}">${money(util - gasto)}</span></div>
-    <div class="tiny">Ticket promedio ${money(ticket)} · margen ${totalV ? Math.round(util / totalV * 100) : 0}%</div>
+  <div class="card tight">
+    <div style="padding:11px 12px 6px"><h3>Estado de resultados</h3>
+    <div class="tiny">De cada peso vendido, qué te queda de verdad.</div></div>
+    ${[
+      ['Ventas', r.ventas, 'var(--ink)', false],
+      ['− Costo de la mercancía', -r.costo, 'var(--ink2)', false],
+      ['= Ganancia bruta', r.bruta, '#0B9A4E', true],
+      ['− Gastos variables', -r.variables, 'var(--ink2)', false],
+      ['− Gastos fijos', -r.fijos, 'var(--ink2)', false],
+      ['− Mermas', -r.merma, 'var(--rojo)', false]
+    ].map(([n, v, c, b]) => `<div class="item" style="padding:8px 12px">
+      <div class="g"><div class="t" style="font-weight:${b ? 700 : 500};color:${c}">${n}</div></div>
+      <div class="v num" style="color:${c}">${v < 0 ? '-' : ''}${money(Math.abs(v))}</div></div>`).join('')}
+    <div class="between" style="padding:11px 12px;background:${r.neta >= 0 ? '#E8F7EE' : 'var(--rojo-l)'}">
+      <div><b style="font-size:15px">GANANCIA NETA</b>
+      <div class="tiny">${r.ventas ? Math.round(r.neta / r.ventas * 100) : 0}% de lo vendido</div></div>
+      <span class="disp num" style="font-size:26px;color:${r.neta >= 0 ? '#0B9A4E' : 'var(--rojo)'}">${money(r.neta)}</span>
+    </div>
   </div>
 
-  ${dl.length > 1 ? `<div class="card"><h3>Venta por día</h3>
-    ${dl.map(([k, v]) => `<div style="margin-bottom:7px"><div class="between tiny"><span>${k.slice(5)}</span><b class="num">${money(v)}</b></div>
-    <div class="bar"><i style="width:${Math.round(v / maxD * 100)}%"></i></div></div>`).join('')}</div>` : ''}
+  ${fijoMes > 0 ? `<div class="card">
+    <div class="between"><h3>Punto de equilibrio</h3>
+    <span class="bad ${avance >= 100 ? 'v' : 'n'}">${avance}%</span></div>
+    <p class="tiny" style="margin:0 0 8px">Con un margen del ${Math.round(r.margen)}%, necesitas vender
+    <b>${money(equilibrioDia)}</b> al día solo para cubrir los gastos fijos. Vas en <b>${money(ventaDia)}</b>.</p>
+    <div class="bar" style="height:11px"><i style="width:${avance}%;background:${avance >= 100 ? '#0B9A4E' : 'var(--rosa)'}"></i></div>
+    <div class="tiny" style="margin-top:6px">${avance >= 100
+      ? 'Ya cubres los fijos. Todo lo que vendas por encima es ganancia.'
+      : 'Te faltan ' + money(Math.max(0, equilibrioDia - ventaDia)) + ' al día para no perder.'}</div>
+  </div>` : `<div class="card" style="border-color:var(--amarillo);background:#FFF8E1">
+    <b style="font-size:14px">Calcula tu punto de equilibrio</b>
+    <p class="tiny" style="margin:4px 0 8px">Dime cuánto pagas al mes de arriendo, servicios y nómina, y te digo cuánto tienes que vender al día para no perder plata.</p>
+    <button class="btn sm ama" data-act="fijos">Poner mis gastos fijos</button>
+  </div>`}
+
+  ${rangoH.length ? `<div class="card"><h3>A qué hora vendes más</h3>
+    <p class="tiny" style="margin:0 0 8px">La hora más fuerte es a las <b>${pico}:00</b>.</p>
+    ${rangoH.map(h => `<div style="margin-bottom:6px">
+      <div class="between tiny"><span class="num">${String(h.i).padStart(2, '0')}:00</span><b class="num">${money(h.v)}</b></div>
+      <div class="bar"><i style="width:${Math.round(h.v / maxH * 100)}%;background:${h.i === pico ? 'var(--rosa)' : 'var(--azul)'}"></i></div>
+    </div>`).join('')}</div>` : ''}
+
+  ${repRango !== 'hoy' && repRango !== 'ayer' ? `<div class="card"><h3>Qué día vendes más</h3>
+    ${sem.map((v, i) => v > 0 ? `<div style="margin-bottom:6px">
+      <div class="between tiny"><span>${DIAS[i]}</span><b class="num">${money(v)}</b></div>
+      <div class="bar"><i style="width:${Math.round(v / maxS * 100)}%;background:${v === maxS ? 'var(--rosa)' : 'var(--azul)'}"></i></div>
+    </div>` : '').join('')}</div>` : ''}
 
   <div class="card"><h3>Lo que más se vende</h3>
     ${tops.length ? tops.map(t => `<div style="margin-bottom:8px">
@@ -1673,6 +2319,13 @@ function vistaReportes() {
       <div class="bar"><i style="width:${Math.round(t.v / maxV * 100)}%"></i></div></div>`).join('')
       : '<p class="muted" style="margin:0">Sin ventas en este rango.</p>'}
   </div>
+
+  ${porGanancia.length ? `<div class="card"><h3>Lo que más ganancia deja</h3>
+    <p class="tiny" style="margin:0 0 8px">No siempre es lo que más se vende.</p>
+    ${porGanancia.map(t => `<div class="between" style="padding:5px 0;border-bottom:1px solid var(--line2)">
+      <span style="font-size:13.5px">${esc(t.n)}</span>
+      <b class="num" style="color:#0B9A4E">${money(t.g)}</b></div>`).join('')}
+  </div>` : ''}
 
   <div class="card"><h3>Cómo pagaron</h3>
     ${Object.keys(met).length ? METODOS.filter(m => met[m.k]).map(m => `
@@ -1688,43 +2341,67 @@ function vistaReportes() {
       : '<p class="muted" style="margin:0">—</p>'}
   </div>
 
-  ${gs.length ? `<div class="card tight"><div style="padding:12px 12px 4px"><h3>Gastos del rango</h3></div>
-    ${gs.sort((a, b) => b.createdAt - a.createdAt).map(g => `<div class="item">
-      <div class="g"><div class="t">${esc(g.concepto)}</div><div class="s">${esc(g.categoria || '')} · ${fecha(g.createdAt)}</div></div>
+  ${r.ms.length ? `<div class="card tight"><div style="padding:12px 12px 4px"><h3>Mermas del rango</h3></div>
+    ${r.ms.sort((a, b) => b.createdAt - a.createdAt).slice(0, 12).map(m => `<div class="item">
+      <div class="g"><div class="t">${esc(m.nombre)}</div><div class="s">${esc(m.razon)} · ${fecha(m.createdAt)}</div></div>
+      <div class="v num" style="color:var(--rojo)">-${money(m.valor)}</div></div>`).join('')}</div>` : ''}
+
+  ${r.gs.length ? `<div class="card tight"><div style="padding:12px 12px 4px"><h3>Gastos del rango</h3></div>
+    ${r.gs.sort((a, b) => b.createdAt - a.createdAt).map(g => `<div class="item" data-gasto="${g.id}" role="button" tabindex="0">
+      <div class="g"><div class="t">${esc(g.concepto)} ${g.tipo === 'fijo' ? '<span class="bad g">fijo</span>' : ''} ${g.conRecibo ? '<span class="bad v">recibo</span>' : ''}</div>
+      <div class="s">${esc(g.categoria || '')} · ${fecha(g.createdAt)}</div></div>
       <div class="v num" style="color:var(--rojo)">-${money(g.monto)}</div></div>`).join('')}</div>` : ''}
 
   <div class="grid2">
-    <button class="btn ghost" data-act="exportar">Descargar Excel/CSV</button>
+    <button class="btn ghost" data-act="exportar">Descargar Excel</button>
     <button class="btn ghost" data-act="repwa">Enviar resumen</button>
   </div>`;
 }
 
 function resumenTexto() {
   const [d, hs] = limitesRango();
-  const vs = rangoVentas(d, hs);
-  const gs = DB.all('gastos').filter(g => g.createdAt >= d && g.createdAt <= hs);
-  const totalV = vs.reduce((s, v) => s + v.total, 0);
-  const util = vs.reduce((s, v) => s + (v.utilidad || 0), 0);
-  const gasto = gs.reduce((s, g) => s + (Number(g.monto) || 0), 0);
+  const r = resumen(d, hs);
+  const nom = { hoy: 'hoy', ayer: 'ayer', semana: 'últimos 7 días', mes: 'últimos 30 días' }[repRango];
   return [
     CFG.tienda + ' · ' + CFG.sede,
-    'Reporte: ' + ({ hoy: 'hoy', ayer: 'ayer', semana: 'últimos 7 días', mes: 'últimos 30 días' }[repRango]),
+    'Reporte: ' + nom,
     '--------------------------------',
-    'Ventas: ' + money(totalV) + ' (' + vs.length + ' tickets)',
-    'Utilidad bruta: ' + money(util),
-    'Gastos: ' + money(gasto),
-    'Ganancia neta: ' + money(util - gasto)
-  ].join('\n');
+    'Ventas: ' + money(r.ventas) + ' (' + r.tickets + ' tickets)',
+    'Ticket promedio: ' + money(r.ticket),
+    'Ganancia bruta: ' + money(r.bruta) + ' (' + Math.round(r.margen) + '%)',
+    'Gastos: ' + money(r.gastos),
+    r.merma ? 'Mermas: ' + money(r.merma) : '',
+    '--------------------------------',
+    'GANANCIA NETA: ' + money(r.neta)
+  ].filter(Boolean).join('\n');
 }
 
 function exportarCSV() {
   const [d, hs] = limitesRango();
   const vs = rangoVentas(d, hs).sort((a, b) => a.createdAt - b.createdAt);
-  const filas = [['Fecha', 'Venta', 'Producto', 'Unidad', 'Cantidad', 'Precio', 'Total linea', 'Metodo', 'Empleado', 'Total venta']];
-  vs.forEach(v => v.items.forEach(i => filas.push([
-    new Date(v.createdAt).toLocaleString('es-CO'), v.numero, i.nombre, i.unidad,
-    i.unidad === 'kg' ? (i.peso || 0) : i.cant, i.precio, i.total, v.metodo, v.empleado, v.total
-  ])));
+  const filas = [['Fecha', 'Venta', 'Producto', 'Categoria', 'Unidad', 'Cantidad', 'Costo unit', 'Precio', 'Total linea', 'Ganancia linea', 'Metodo', 'Empleado', 'Cuenta', 'Total venta']];
+  vs.forEach(v => v.items.forEach(i => {
+    const q = i.unidad === 'kg' ? (i.peso || 0) : i.cant;
+    const pr = DB.get('productos', i.pid);
+    filas.push([
+      new Date(v.createdAt).toLocaleString('es-CO'), v.numero, i.nombre,
+      pr ? (pr.categoria || '') : '', i.unidad, q, i.costo || 0, i.precio, i.total,
+      Math.round(i.total - (i.costo || 0) * q), v.metodo, v.empleado, v.cuenta || '', v.total
+    ]);
+  }));
+  const [gd, gh] = limitesRango();
+  filas.push([]);
+  filas.push(['GASTOS']);
+  filas.push(['Fecha', 'Concepto', 'Categoria', 'Tipo', 'Monto', 'Empleado']);
+  DB.all('gastos').filter(g => g.createdAt >= gd && g.createdAt <= gh)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .forEach(g => filas.push([new Date(g.createdAt).toLocaleString('es-CO'), g.concepto, g.categoria || '', g.tipo || 'variable', g.monto, g.empleado || '']));
+  filas.push([]);
+  filas.push(['MERMAS']);
+  filas.push(['Fecha', 'Producto', 'Cantidad', 'Motivo', 'Perdida', 'Empleado']);
+  DB.all('mermas').filter(m => m.createdAt >= gd && m.createdAt <= gh)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .forEach(m => filas.push([new Date(m.createdAt).toLocaleString('es-CO'), m.nombre, m.cant, m.razon, m.valor, m.empleado || '']));
   const csv = '\uFEFF' + filas.map(f => f.map(c => `"${String(c).replace(/"/g, '""')}"`).join(';')).join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -1739,9 +2416,13 @@ function vistaMas() {
   return `
   <div class="card tight">
     ${[
+      ['cuentas', 'Cuentas abiertas', cuentasAbiertas().length ? cuentasAbiertas().length + ' abiertas · ' + money(totalAbierto()) : 'ninguna abierta'],
       ['clientes', 'Clientes y fiados', deuda > 0 ? money(deuda) + ' por cobrar' : cl.length + ' clientes'],
       ['empleados', 'Empleados y claves', DB.all('empleados').length + ' registrados'],
+      ['mermas', 'Mermas y pérdidas', money(valorMermas(inicioDia() - 29 * 864e5, now())) + ' en 30 días'],
+      ['fijos', 'Gastos fijos y meta', Number(CFG.gastosFijosMes) ? money(CFG.gastosFijosMes) + ' al mes' : 'sin configurar'],
       ['balanza', 'Balanza y escáner', A.balanza.vivo ? 'Balanza conectada' : 'Configurar equipos'],
+      ['impresora', 'Impresora de tirillas', (Number(CFG.ticketAncho) || 32) + ' columnas · RawBT'],
       ['ajustes', 'Datos de la tienda', esc(CFG.tienda) + ' · ' + esc(CFG.sede)],
       ['nube', 'Conexión a la nube', A.dbf ? 'Conectada' : 'Sin configurar'],
       ['copia', 'Copia de seguridad', 'Descargar o restaurar'],
@@ -1984,6 +2665,64 @@ function vistaBalanza() {
   });
 }
 
+/* --- Impresora de tirillas --- */
+function vistaImpresora() {
+  sheet('Impresora de tirillas', `
+    <p class="muted">La app imprime en impresoras térmicas Bluetooth usando <b>RawBT</b>, una app gratis de la Play Store. Es la misma forma que usa Conty POS.</p>
+    <div class="card">
+      <h3>Cómo dejarlo listo</h3>
+      <p class="tiny" style="margin:0">1. Instala <b>RawBT</b> desde la Play Store.<br>
+      2. Empareja la impresora en el Bluetooth del celular.<br>
+      3. Abre RawBT y escógela como impresora predeterminada.<br>
+      4. Vuelve aquí y prueba.</p>
+    </div>
+    <div class="grid2">
+      <label class="f"><span>Ancho del papel</span>
+        <select id="i_a">
+          <option value="32" ${Number(CFG.ticketAncho) === 32 ? 'selected' : ''}>58 mm (32 columnas)</option>
+          <option value="48" ${Number(CFG.ticketAncho) === 48 ? 'selected' : ''}>80 mm (48 columnas)</option>
+        </select></label>
+      <label class="f"><span>Impuesto en la tirilla</span>
+        <input id="i_p" type="number" inputmode="numeric" value="${CFG.impPct || 0}" placeholder="0"></label>
+    </div>
+    <label class="f"><span>Nombre del impuesto</span><input id="i_n" type="text" value="${esc(CFG.impNombre || 'IVA')}"></label>
+    <p class="tiny">Deja el impuesto en <b>0</b> si tus precios ya lo incluyen y no necesitas discriminarlo.</p>
+    <div class="card" style="background:var(--line2)">
+      <div class="eyebrow" style="margin-bottom:6px">Así va a salir</div>
+      <pre id="i_prev" style="font:12px/1.35 ui-monospace,'Courier New',monospace;margin:0;white-space:pre;overflow-x:auto;color:var(--ink)"></pre>
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      <button class="btn" id="i_test">Imprimir prueba</button>
+      <button class="btn pri" id="i_ok">Guardar</button>
+    </div>`, () => {
+    const demo = () => ({
+      numero: 'PRUEBA', createdAt: now(), empleado: A.user.nombre,
+      items: [
+        { nombre: 'Arroz Diana 500g', unidad: 'und', cant: 2, precio: 3200, total: 6400 },
+        { nombre: 'Tomate chonto', unidad: 'kg', peso: 1.25, precio: 4800, total: 6000 }
+      ],
+      subtotal: 12400, descuento: 0, total: 12400,
+      pagos: [{ metodo: 'efectivo', monto: 12400 }], recibido: 20000, cambio: 7600
+    });
+    const pinta = () => {
+      const viejo = { ...CFG };
+      Object.assign(CFG, {
+        ticketAncho: Number($('#i_a').value) || 32,
+        impPct: parseFloat($('#i_p').value) || 0,
+        impNombre: $('#i_n').value.trim() || 'IVA'
+      });
+      $('#i_prev').textContent = ticketTexto(demo());
+      const nuevo = { ticketAncho: CFG.ticketAncho, impPct: CFG.impPct, impNombre: CFG.impNombre };
+      Object.assign(CFG, viejo);
+      return nuevo;
+    };
+    ['i_a', 'i_p', 'i_n'].forEach(id => { const e = $('#' + id); e.oninput = pinta; e.onchange = pinta; });
+    $('#i_test').onclick = () => { const c = pinta(); const v = { ...CFG }; Object.assign(CFG, c); imprimirTermica(ticketTexto(demo())); Object.assign(CFG, v); };
+    $('#i_ok').onclick = () => { DB.cfg(pinta()); toast('Guardado', 'ok'); cerrarSheet(); };
+    pinta();
+  });
+}
+
 /* --- Datos de la tienda --- */
 function vistaAjustes() {
   sheet('Datos de la tienda', `
@@ -2004,7 +2743,9 @@ function vistaAjustes() {
         <option value="100" ${CFG.redondeo == 100 ? 'selected' : ''}>Múltiplos de $100</option>
       </select></label>
     <div class="inline-check"><input type="checkbox" id="a_al" ${CFG.alertaStock ? 'checked' : ''}><label for="a_al">Avisarme cuando un producto quede en poco stock</label></div>
+    <button class="btn ghost sm full" style="margin-top:6px" id="a_fij">Gastos fijos y meta diaria</button>
     <button class="btn pri xl" style="margin-top:10px" id="a_ok">Guardar</button>`, () => {
+    $('#a_fij').onclick = () => modalFijos();
     $('#a_ok').onclick = () => {
       DB.cfg({
         tienda: $('#a_t').value.trim() || 'Conty Market', sede: $('#a_s').value.trim() || 'Principal',
@@ -2263,6 +3004,7 @@ function pintarTop() {
 
 function pintar() {
   if (!A.user) return pantallaInicio();
+  if (A.cuenta) guardarCuenta();
   if (!puede(A.tab)) A.tab = TABS.find(t => t.roles.includes(A.user.rol)).k;
 
   const cuerpo = {
@@ -2312,7 +3054,7 @@ function montar() {
 
   // Delegación general de clics
   $('#app').onclick = e => {
-    const el = e.target.closest('[data-act],[data-add],[data-quitar],[data-plus],[data-mas],[data-menos],[data-edit],[data-cat],[data-vcat],[data-rango],[data-turno]');
+    const el = e.target.closest('[data-act],[data-add],[data-quitar],[data-plus],[data-mas],[data-menos],[data-edit],[data-cat],[data-vcat],[data-rango],[data-turno],[data-gasto]');
     if (!el) return;
     const d = el.dataset;
 
@@ -2325,12 +3067,17 @@ function montar() {
     if (d.cat !== undefined) { A.filtroCat = d.cat; pintar(); return; }
     if (d.rango) { repRango = d.rango; pintar(); return; }
     if (d.turno) { const t = DB.get('turnos', d.turno); if (t) modalResumenTurno(t); return; }
+    if (d.gasto) return verRecibo(d.gasto);
 
     if (d.mas) {   // menú "Más"
       const m = d.mas;
+      if (m === 'cuentas') return vistaCuentas();
       if (m === 'clientes') return vistaClientes();
       if (m === 'empleados') return vistaEmpleados();
+      if (m === 'mermas') return vistaMermas();
+      if (m === 'fijos') return modalFijos();
       if (m === 'balanza') return vistaBalanza();
+      if (m === 'impresora') return vistaImpresora();
       if (m === 'ajustes') return vistaAjustes();
       if (m === 'nube') return vistaNube();
       if (m === 'copia') return vistaCopia();
@@ -2339,17 +3086,22 @@ function montar() {
 
     switch (d.act) {
       case 'cobrar': return modalCobro();
+      case 'cuentas': return vistaCuentas();
+      case 'ctaopc': return modalCuentaOpciones();
+      case 'salircta': return salirCuenta();
       case 'vaciar': return confirmar('¿Vaciar el carrito?', limpiarCarrito, 'Sí, vaciar');
       case 'suelto': return modalSuelto();
       case 'descuento': return modalDescuento();
       case 'nuevoprod': return formProducto();
       case 'entrada': return formEntrada();
+      case 'mermas': return vistaMermas();
       case 'importar': return formImportar();
       case 'abrircaja': return modalAbrirCaja();
       case 'gasto': return modalGasto();
       case 'cerrarcaja': return modalCerrarCaja();
       case 'verventas': return modalVentasTurno();
       case 'exportar': return exportarCSV();
+      case 'fijos': return modalFijos();
       case 'pedidowa': {
         if (!paraPedir().length) return toast('No hay nada por pedir', 'ok');
         return window.open('https://wa.me/?text=' + encodeURIComponent(listaPedido()), '_blank');

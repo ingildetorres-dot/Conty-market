@@ -1,6 +1,6 @@
 /* Conty Market POS · service worker
    Guarda la app en el equipo para que abra y venda sin internet. */
-const CACHE = 'conty-market-v2';
+const CACHE = 'conty-market-v3';
 const ARCHIVOS = [
   './',
   './index.html',
